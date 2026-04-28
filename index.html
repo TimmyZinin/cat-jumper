@@ -26,7 +26,7 @@
 <body>
   <div id="wrap"><canvas id="game" width="640" height="360"></canvas></div>
   <div id="title">CAT JUMPER</div>
-  <div id="hint">W = JUMP &nbsp;·&nbsp; A / D = MOVE &nbsp;·&nbsp; E = DASH &nbsp;·&nbsp; R = RESTART &nbsp;·&nbsp; M = MUTE</div>
+  <div id="hint">W = JUMP &nbsp;·&nbsp; A / D = MOVE &nbsp;·&nbsp; E = DASH &nbsp;·&nbsp; R = RESTART &nbsp;·&nbsp; M = SOUND ON/OFF (off by default)</div>
 
 <script>
 'use strict';
@@ -84,24 +84,32 @@ window.addEventListener('blur', () => { for (const k in KEYS) KEYS[k] = false; }
 //  AUDIO ENGINE (Web Audio API procedural)
 // ============================================================
 const Audio = (() => {
-  let ctxA = null, master = null, musicGain = null, sfxGain = null;
-  let muted = false, unlocked = false;
+  let ctxA = null, master = null, musicGain = null, sfxGain = null, lowpass = null;
+  let muted = true, unlocked = false; // start muted — sound only after user presses M
   let musicTimer = null;
   let melodyStep = 0;
+  const MASTER_VOL = 0.22;
 
   function unlock() {
     if (unlocked) return;
     unlocked = true;
     try {
       ctxA = new (window.AudioContext || window.webkitAudioContext)();
-      master = ctxA.createGain(); master.gain.value = 0.6; master.connect(ctxA.destination);
-      musicGain = ctxA.createGain(); musicGain.gain.value = 0.18; musicGain.connect(master);
-      sfxGain = ctxA.createGain(); sfxGain.gain.value = 0.5; sfxGain.connect(master);
+      master = ctxA.createGain();
+      master.gain.value = muted ? 0 : MASTER_VOL;
+      lowpass = ctxA.createBiquadFilter();
+      lowpass.type = 'lowpass';
+      lowpass.frequency.value = 2200;
+      lowpass.Q.value = 0.5;
+      master.connect(lowpass);
+      lowpass.connect(ctxA.destination);
+      musicGain = ctxA.createGain(); musicGain.gain.value = 0.06; musicGain.connect(master);
+      sfxGain = ctxA.createGain(); sfxGain.gain.value = 0.22; sfxGain.connect(master);
       startMusic();
     } catch(e) { /* no audio */ }
   }
 
-  function blip(freq, dur, type='square', vol=0.3, attack=0.005, release=0.05) {
+  function blip(freq, dur, type='triangle', vol=0.18, attack=0.008, release=0.06) {
     if (!ctxA || muted) return;
     const o = ctxA.createOscillator();
     const g = ctxA.createGain();
@@ -113,24 +121,24 @@ const Audio = (() => {
     o.start(); o.stop(ctxA.currentTime + dur + release + 0.05);
   }
 
-  function noiseBurst(dur, vol=0.3) {
+  function noiseBurst(dur, vol=0.12) {
     if (!ctxA || muted) return;
     const buf = ctxA.createBuffer(1, ctxA.sampleRate * dur, ctxA.sampleRate);
     const data = buf.getChannelData(0);
     for (let i = 0; i < data.length; i++) data[i] = (Math.random()*2-1) * (1 - i/data.length);
     const src = ctxA.createBufferSource(); src.buffer = buf;
     const g = ctxA.createGain(); g.gain.value = vol;
-    const f = ctxA.createBiquadFilter(); f.type='highpass'; f.frequency.value=1200;
+    const f = ctxA.createBiquadFilter(); f.type='bandpass'; f.frequency.value=900; f.Q.value = 1;
     src.connect(f); f.connect(g); g.connect(sfxGain);
     src.start();
   }
 
-  function jump() { blip(420, 0.05, 'square', 0.25); blip(620, 0.07, 'square', 0.18, 0.005, 0.08); }
-  function dash() { blip(220, 0.08, 'sawtooth', 0.3, 0.005, 0.1); noiseBurst(0.15, 0.15); }
-  function land() { blip(180, 0.04, 'square', 0.2); }
-  function die()  { blip(330,0.08,'sawtooth',0.3); setTimeout(()=>blip(180,0.15,'sawtooth',0.3),60); setTimeout(()=>blip(90,0.25,'square',0.3),140); }
-  function goal() { [523,659,784,1046].forEach((f,i)=>setTimeout(()=>blip(f,0.12,'square',0.28),i*90)); }
-  function step() { blip(80 + Math.random()*40, 0.02, 'square', 0.05); }
+  function jump() { blip(440, 0.08, 'sine', 0.16, 0.005, 0.1); blip(660, 0.06, 'triangle', 0.08, 0.005, 0.08); }
+  function dash() { blip(280, 0.1, 'triangle', 0.18, 0.005, 0.12); noiseBurst(0.1, 0.06); }
+  function land() { blip(140, 0.05, 'sine', 0.12); }
+  function die()  { blip(330,0.1,'triangle',0.16); setTimeout(()=>blip(180,0.15,'triangle',0.14),80); setTimeout(()=>blip(110,0.22,'sine',0.14),180); }
+  function goal() { [523,659,784,1046].forEach((f,i)=>setTimeout(()=>blip(f,0.14,'triangle',0.16),i*100)); }
+  function step() { /* footsteps removed — too busy */ }
 
   const SCALE = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25];
   function startMusic() {
@@ -138,36 +146,40 @@ const Audio = (() => {
     musicTimer = setInterval(() => {
       if (!ctxA || muted) return;
       const biome = state.level ? (state.level.idx <= 2 ? 0 : (state.level.idx <= 4 ? 1 : 2)) : 0;
+      // Bass on every 4th step, slower
       if (melodyStep % 4 === 0) {
         const bassNotes = [65.41, 73.42, 87.31, 65.41];
         const t = ctxA.currentTime;
-        const o = ctxA.createOscillator(); o.type='triangle';
+        const o = ctxA.createOscillator(); o.type='sine';
         o.frequency.value = bassNotes[(melodyStep/4)%bassNotes.length];
         const g = ctxA.createGain();
-        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.18, t+0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, t+0.55);
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.12, t+0.04);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+0.7);
         o.connect(g); g.connect(musicGain);
-        o.start(t); o.stop(t+0.6);
+        o.start(t); o.stop(t+0.75);
       }
-      const leadNotes = biome === 0 ? [0,2,4,2, 0,3,5,3] :
-                        biome === 1 ? [4,5,7,5, 4,2,4,2] :
-                                      [2,4,5,7, 5,4,2,0];
-      const idx = leadNotes[melodyStep % leadNotes.length];
-      const t = ctxA.currentTime;
-      const o = ctxA.createOscillator(); o.type='square';
-      o.frequency.value = SCALE[idx];
-      const g = ctxA.createGain();
-      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.06, t+0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, t+0.18);
-      o.connect(g); g.connect(musicGain);
-      o.start(t); o.stop(t+0.22);
+      // Lead on every 2nd step (sparser, calmer)
+      if (melodyStep % 2 === 0) {
+        const leadNotes = biome === 0 ? [0,2,4,2, 0,3,5,3] :
+                          biome === 1 ? [4,5,7,5, 4,2,4,2] :
+                                        [2,4,5,7, 5,4,2,0];
+        const idx = leadNotes[(melodyStep/2) % leadNotes.length];
+        const t = ctxA.currentTime;
+        const o = ctxA.createOscillator(); o.type='triangle';
+        o.frequency.value = SCALE[idx];
+        const g = ctxA.createGain();
+        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.05, t+0.04);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+0.32);
+        o.connect(g); g.connect(musicGain);
+        o.start(t); o.stop(t+0.36);
+      }
       melodyStep++;
-    }, 220);
+    }, 340);
   }
 
   function setMuted(v) {
     muted = v;
-    if (master) master.gain.value = muted ? 0 : 0.6;
+    if (master) master.gain.value = muted ? 0 : MASTER_VOL;
   }
   function toggleMute() { setMuted(!muted); return muted; }
   return { unlock, jump, dash, land, die, goal, step, toggleMute, isMuted: () => muted };
@@ -177,6 +189,7 @@ const Audio = (() => {
 //  LEVELS
 // ============================================================
 const RAW_LEVELS = [
+// LEVEL 1 — pure tutorial, no spikes
 [
   "................................",
   "................................",
@@ -189,14 +202,15 @@ const RAW_LEVELS = [
   "...P.......................G....",
   "...XX..........====.............",
   "...XX..........XXXX....====.....",
-  "...XX^^^.......XXXX............X",
-  "...XXXXX..^^^^.XXXX....XXXX...XX",
+  "...XX..........XXXX............X",
+  "...XXXXX.......XXXX....XXXX...XX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 2 — gentle introduction to spikes
 [
   "................................",
   "................................",
@@ -210,13 +224,14 @@ const RAW_LEVELS = [
   "..XX....................XXXXXXXX",
   "..XX..........====..............",
   "..XX..........XXXX..............",
-  "..XX^^^^......XXXX..^^^^........",
-  "..XXXXXXX^^^^^XXXX^^XXXX^^^^^^^^",
-  "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "..XX..........XXXX..............",
+  "..XX^^........XXXX..^^..........",
+  "..XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 3 — vertical climb (no bottom spikes, just keep climbing)
 [
   "..............................G.",
   "..........................XXXXXX",
@@ -231,12 +246,13 @@ const RAW_LEVELS = [
   "................................",
   ".P............C.................",
   ".XX.............................",
-  ".XX.....^^^^........^^^^........",
-  ".XX^^^^XXXXX^^^^^^^XXXXX^^^^^^^^",
+  ".XX.....^^..........^^..........",
+  ".XX....XXXX........XXXX.........",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 4 — first snow level, gentle
 [
   "................................",
   "................................",
@@ -251,12 +267,13 @@ const RAW_LEVELS = [
   "..P.....................XX....G.",
   "..XX....................XX...XXX",
   "..XX..........D.........XX......",
-  "..XX^^^^........^^^^^^^^XX......",
-  "..XXXXXX^^^^^^^^XXXXXXXXXX^^^^^^",
+  "..XX^^..........^^......XX......",
+  "..XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 5 — snow peak — small spike islands, lots of safe ground
 [
   "...............................G",
   "..............................XX",
@@ -271,12 +288,13 @@ const RAW_LEVELS = [
   "................................",
   "..P.............................",
   "..XX............................",
-  "..XX^^^......^^^......^^^.......",
-  "..XXXXX^^^^^XXXX^^^^^XXXX^^^^^^^",
+  "..XX....^^........^^......^^....",
+  "..XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 6 — Welcome to Kaş — soft platform run
 [
   "................................",
   "................................",
@@ -290,13 +308,14 @@ const RAW_LEVELS = [
   "..P.............................",
   "..XX............................",
   "..XX....====....................",
-  "..XX....XXXX....................",
-  "..XX^^^^XXXX..====...====...===G",
-  "..XXXXXXXXXX^^XXXX^^^XXXX^^^XXXX",
+  "..XX....XXXX..====....====....=G",
+  "..XX....XXXX..XXXX....XXXX....XX",
+  "..XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 7 — Whitewashed roofs (jump up one big block)
 [
   "................................",
   "................................",
@@ -311,12 +330,13 @@ const RAW_LEVELS = [
   "XX.....C..XXXXXXXX..............",
   "XX........XXXXXXXX..............",
   "XX....====XXXXXXXX..............",
-  "XX^^^^XXXXXXXXXXXX^^^^..........",
-  "XXXXXXXXXXXXXXXXXXXXXX^^^^^^^^^^",
+  "XX....XXXXXXXXXXXX..............",
+  "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 8 — Harbour pier — easier dash gaps
 [
   "................................",
   "................................",
@@ -331,12 +351,13 @@ const RAW_LEVELS = [
   "..P.....................XX....G.",
   "..XX....................XX...XXX",
   "..XX....................XX......",
-  "..XX^^^^........^^^^^^^^XX......",
-  "..XXXXXX^^^^^^^^XXXXXXXXXX^^^^^^",
+  "..XX....^^........^^....XX......",
+  "..XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 9 — Cliffside — softer staircase, one spike per step
 [
   "................................",
   "................................",
@@ -345,35 +366,36 @@ const RAW_LEVELS = [
   "................................",
   "..............................G.",
   ".............................XXX",
-  "...........................^...X",
-  ".........................XX...XX",
-  ".......................^........",
-  ".....................XX.........",
-  "...................^............",
-  ".P...............XX.....C.......",
-  ".XX...^^^.....^^................",
-  ".XX..XXXXX..XXXX................",
-  ".XX^^XXXXX^^XXXX^^^^^^^^^^^^^^^^",
+  "...........................^..XX",
+  ".........................XXX..XX",
+  "........................XXX....",
+  ".....................XXX.......",
+  "....................XXX........",
+  ".P...............XXX....C.......",
+  ".XX..............XXX............",
+  ".XX...XXXXX....XXXX.............",
+  ".XXXXXXXXXXXXXXXXXX.............",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
+// LEVEL 10 — Summit — staircase climb (no bottom spike row)
 [
   "...............................G",
   "..............................XX",
   "................................",
-  "............................^...",
-  "..........................XXX...",
+  "............................XXXX",
+  "..........................XX....",
   "................................",
-  ".......................^........",
+  ".......................XX.......",
   ".....................XXX........",
-  "..................^.............",
+  "................................",
   "................XXX.............",
-  "..............^........C........",
+  ".......................C........",
   "............XXX.................",
-  ".........^......................",
+  "................................",
   ".P.....XXX......................",
-  ".XX^^...........................",
-  ".XXXX^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+  ".XX.............................",
+  ".XXXX...........................",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
 ],
@@ -436,12 +458,12 @@ const player = {
 };
 
 const PHYS = {
-  G: 0.42, MAX_FALL: 9,
-  ACC: 0.5, FRIC: 0.78, AIR_FRIC: 0.92,
-  MAX_VX: 3.2,
-  JUMP: -7.6,
-  COYOTE: 6, JUMP_BUF: 7,
-  DASH_SPEED: 7.5, DASH_FRAMES: 10, DASH_CD: 36,
+  G: 0.38, MAX_FALL: 8,
+  ACC: 0.55, FRIC: 0.78, AIR_FRIC: 0.93,
+  MAX_VX: 3.4,
+  JUMP: -8.0,
+  COYOTE: 9, JUMP_BUF: 9,
+  DASH_SPEED: 7.0, DASH_FRAMES: 10, DASH_CD: 22,
 };
 
 function resetPlayer(level) {
@@ -1197,8 +1219,8 @@ function drawHUD() {
   ctx.strokeRect(W - cdW - 12.5, 17.5, cdW+1, 5);
 
   if (Audio.isMuted()) {
-    ctx.fillStyle = '#f88';
-    ctx.fillText('MUTED (M)', W - cdW - 12, 32);
+    ctx.fillStyle = '#9ad';
+    ctx.fillText('M = SOUND ON', W - cdW - 12, 32);
   }
 
   if (state.message) {

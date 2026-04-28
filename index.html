@@ -84,97 +84,205 @@ window.addEventListener('blur', () => { for (const k in KEYS) KEYS[k] = false; }
 //  AUDIO ENGINE (Web Audio API procedural)
 // ============================================================
 const Audio = (() => {
-  let ctxA = null, master = null, musicGain = null, sfxGain = null, lowpass = null;
-  let muted = true, unlocked = false; // start muted — sound only after user presses M
-  let musicTimer = null;
+  // Mix hierarchy (game-audio principles):
+  //   master -> limiter -> destination
+  //   musicGain (-12dB), sfxGain (-3dB) feed master
+  // All voices are pure sine — no square/triangle/saw to avoid harshness.
+  // Every note has 30ms+ attack and 200ms+ release to prevent clicks.
+  // Limiter (DynamicsCompressor) catches any peak overlap → no clipping crackle.
+
+  let ctxA = null, master = null, musicGain = null, sfxGain = null, limiter = null;
+  let muted = true, unlocked = false;
+  let melodyTimer = null;
+  let padNodes = null; // sustained chord pad
   let melodyStep = 0;
-  const MASTER_VOL = 0.22;
+  let lastNoteEnd = 0; // gate to prevent overlap
+
+  const MASTER_VOL = 0.45;
+  const MUSIC_BUS = 0.25;  // -12 dB
+  const SFX_BUS = 0.7;     // -3 dB
 
   function unlock() {
     if (unlocked) return;
     unlocked = true;
     try {
       ctxA = new (window.AudioContext || window.webkitAudioContext)();
+
       master = ctxA.createGain();
       master.gain.value = muted ? 0 : MASTER_VOL;
-      lowpass = ctxA.createBiquadFilter();
-      lowpass.type = 'lowpass';
-      lowpass.frequency.value = 2200;
-      lowpass.Q.value = 0.5;
-      master.connect(lowpass);
-      lowpass.connect(ctxA.destination);
-      musicGain = ctxA.createGain(); musicGain.gain.value = 0.06; musicGain.connect(master);
-      sfxGain = ctxA.createGain(); sfxGain.gain.value = 0.22; sfxGain.connect(master);
-      startMusic();
+
+      limiter = ctxA.createDynamicsCompressor();
+      limiter.threshold.value = -8;
+      limiter.knee.value = 6;
+      limiter.ratio.value = 14;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.25;
+
+      master.connect(limiter);
+      limiter.connect(ctxA.destination);
+
+      musicGain = ctxA.createGain(); musicGain.gain.value = MUSIC_BUS; musicGain.connect(master);
+      sfxGain = ctxA.createGain(); sfxGain.gain.value = SFX_BUS; sfxGain.connect(master);
+
+      startPad();
+      startMelody();
     } catch(e) { /* no audio */ }
   }
 
-  function blip(freq, dur, type='triangle', vol=0.18, attack=0.008, release=0.06) {
+  // Click-free sine note. Uses exponentialRamp from a tiny non-zero floor (0.0001)
+  // to avoid the discontinuity that causes Web Audio crackle.
+  function note(freq, dur, vol, attack=0.04, release=0.25, dest=null) {
     if (!ctxA || muted) return;
+    const t0 = ctxA.currentTime;
     const o = ctxA.createOscillator();
     const g = ctxA.createGain();
-    o.type = type; o.frequency.value = freq;
-    g.gain.setValueAtTime(0, ctxA.currentTime);
-    g.gain.linearRampToValueAtTime(vol, ctxA.currentTime + attack);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctxA.currentTime + dur + release);
-    o.connect(g); g.connect(sfxGain);
-    o.start(); o.stop(ctxA.currentTime + dur + release + 0.05);
+    o.type = 'sine';
+    o.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + attack);
+    g.gain.setValueAtTime(vol, t0 + dur);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur + release);
+    o.connect(g); g.connect(dest || sfxGain);
+    o.start(t0);
+    o.stop(t0 + dur + release + 0.05);
   }
 
-  function noiseBurst(dur, vol=0.12) {
+  // Sweep note (descending/ascending pitch) for SFX
+  function sweep(f1, f2, dur, vol, attack=0.01, dest=null) {
     if (!ctxA || muted) return;
-    const buf = ctxA.createBuffer(1, ctxA.sampleRate * dur, ctxA.sampleRate);
+    const t0 = ctxA.currentTime;
+    const o = ctxA.createOscillator();
+    const g = ctxA.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(f1, t0);
+    o.frequency.exponentialRampToValueAtTime(Math.max(40, f2), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur + 0.15);
+    o.connect(g); g.connect(dest || sfxGain);
+    o.start(t0);
+    o.stop(t0 + dur + 0.2);
+  }
+
+  // Filtered noise — for dash whoosh only
+  function whoosh(dur=0.15, vol=0.12) {
+    if (!ctxA || muted) return;
+    const len = Math.floor(ctxA.sampleRate * dur);
+    const buf = ctxA.createBuffer(1, len, ctxA.sampleRate);
     const data = buf.getChannelData(0);
-    for (let i = 0; i < data.length; i++) data[i] = (Math.random()*2-1) * (1 - i/data.length);
+    for (let i = 0; i < len; i++) {
+      const env = Math.sin(Math.PI * i / len);
+      data[i] = (Math.random()*2-1) * env;
+    }
     const src = ctxA.createBufferSource(); src.buffer = buf;
+    const f = ctxA.createBiquadFilter(); f.type='bandpass'; f.frequency.value=600; f.Q.value=1.5;
     const g = ctxA.createGain(); g.gain.value = vol;
-    const f = ctxA.createBiquadFilter(); f.type='bandpass'; f.frequency.value=900; f.Q.value = 1;
     src.connect(f); f.connect(g); g.connect(sfxGain);
     src.start();
   }
 
-  function jump() { blip(440, 0.08, 'sine', 0.16, 0.005, 0.1); blip(660, 0.06, 'triangle', 0.08, 0.005, 0.08); }
-  function dash() { blip(280, 0.1, 'triangle', 0.18, 0.005, 0.12); noiseBurst(0.1, 0.06); }
-  function land() { blip(140, 0.05, 'sine', 0.12); }
-  function die()  { blip(330,0.1,'triangle',0.16); setTimeout(()=>blip(180,0.15,'triangle',0.14),80); setTimeout(()=>blip(110,0.22,'sine',0.14),180); }
-  function goal() { [523,659,784,1046].forEach((f,i)=>setTimeout(()=>blip(f,0.14,'triangle',0.16),i*100)); }
-  function step() { /* footsteps removed — too busy */ }
+  // SFX — all sine, all gentle envelopes
+  function jump() {
+    sweep(380, 660, 0.12, 0.18);
+  }
+  function dash() {
+    sweep(220, 460, 0.15, 0.18);
+    whoosh(0.18, 0.08);
+  }
+  function land() {
+    note(160, 0.04, 0.16, 0.005, 0.12);
+  }
+  function die() {
+    sweep(420, 90, 0.5, 0.22);
+  }
+  function goal() {
+    // Gentle ascending arpeggio
+    const notes = [523.25, 659.25, 784.0, 1046.5];
+    notes.forEach((f, i) => setTimeout(() => note(f, 0.12, 0.18, 0.02, 0.18), i * 110));
+  }
+  function step() { /* removed — too busy in mix */ }
 
-  const SCALE = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25];
-  function startMusic() {
-    if (musicTimer) clearInterval(musicTimer);
-    musicTimer = setInterval(() => {
+  // SUSTAINED PAD — soft chord drone, the calm bed of the music
+  // Three sustained sine voices forming a chord. Crossfades on biome change.
+  const PAD_CHORDS = {
+    castle: [130.81, 196.00, 233.08],   // C3 G3 Bb3 (minor-ish, mysterious)
+    snow:   [146.83, 220.00, 293.66],   // D3 A3 D4 (bright, open)
+    kas:    [164.81, 246.94, 329.63],   // E3 B3 E4 (warm, hopeful)
+  };
+  let currentBiome = null;
+
+  function startPad() {
+    if (padNodes) return;
+    padNodes = { osc: [], gain: [], master: null };
+    padNodes.master = ctxA.createGain();
+    padNodes.master.gain.value = 0.0;
+    padNodes.master.connect(musicGain);
+    // Gentle slow tremolo via LFO modulating the pad master
+    const lfo = ctxA.createOscillator();
+    const lfoGain = ctxA.createGain();
+    lfo.type = 'sine'; lfo.frequency.value = 0.18;
+    lfoGain.gain.value = 0.05;
+    lfo.connect(lfoGain); lfoGain.connect(padNodes.master.gain);
+    lfo.start();
+    padNodes.lfo = lfo;
+    // 3 sustained voices, frequencies set later
+    for (let i = 0; i < 3; i++) {
+      const o = ctxA.createOscillator();
+      const g = ctxA.createGain();
+      o.type = 'sine';
+      o.frequency.value = 220;
+      g.gain.value = 0.0;
+      o.connect(g); g.connect(padNodes.master);
+      o.start();
+      padNodes.osc.push(o);
+      padNodes.gain.push(g);
+    }
+    // Fade pad master in
+    const t0 = ctxA.currentTime;
+    padNodes.master.gain.setValueAtTime(0, t0);
+    padNodes.master.gain.linearRampToValueAtTime(0.5, t0 + 1.5);
+    // Voice gains
+    padNodes.gain[0].gain.linearRampToValueAtTime(0.18, t0 + 1.5);
+    padNodes.gain[1].gain.linearRampToValueAtTime(0.13, t0 + 1.5);
+    padNodes.gain[2].gain.linearRampToValueAtTime(0.10, t0 + 1.5);
+  }
+
+  function setBiome(biome) {
+    if (!padNodes || biome === currentBiome) return;
+    currentBiome = biome;
+    const chord = PAD_CHORDS[biome] || PAD_CHORDS.castle;
+    const t0 = ctxA.currentTime;
+    padNodes.osc.forEach((o, i) => {
+      o.frequency.cancelScheduledValues(t0);
+      o.frequency.setValueAtTime(o.frequency.value, t0);
+      o.frequency.linearRampToValueAtTime(chord[i], t0 + 1.5);
+    });
+  }
+
+  // SPARSE MELODY — one short pluck every 1.6s, only on alternating beats
+  // No more than one note alive at a time → no overlap crackle.
+  function startMelody() {
+    if (melodyTimer) clearInterval(melodyTimer);
+    melodyTimer = setInterval(() => {
       if (!ctxA || muted) return;
-      const biome = state.level ? (state.level.idx <= 2 ? 0 : (state.level.idx <= 4 ? 1 : 2)) : 0;
-      // Bass on every 4th step, slower
-      if (melodyStep % 4 === 0) {
-        const bassNotes = [65.41, 73.42, 87.31, 65.41];
-        const t = ctxA.currentTime;
-        const o = ctxA.createOscillator(); o.type='sine';
-        o.frequency.value = bassNotes[(melodyStep/4)%bassNotes.length];
-        const g = ctxA.createGain();
-        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.12, t+0.04);
-        g.gain.exponentialRampToValueAtTime(0.0001, t+0.7);
-        o.connect(g); g.connect(musicGain);
-        o.start(t); o.stop(t+0.75);
-      }
-      // Lead on every 2nd step (sparser, calmer)
-      if (melodyStep % 2 === 0) {
-        const leadNotes = biome === 0 ? [0,2,4,2, 0,3,5,3] :
-                          biome === 1 ? [4,5,7,5, 4,2,4,2] :
-                                        [2,4,5,7, 5,4,2,0];
-        const idx = leadNotes[(melodyStep/2) % leadNotes.length];
-        const t = ctxA.currentTime;
-        const o = ctxA.createOscillator(); o.type='triangle';
-        o.frequency.value = SCALE[idx];
-        const g = ctxA.createGain();
-        g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.05, t+0.04);
-        g.gain.exponentialRampToValueAtTime(0.0001, t+0.32);
-        o.connect(g); g.connect(musicGain);
-        o.start(t); o.stop(t+0.36);
-      }
+      // Update biome from current level
+      const biome = state.level ? (state.level.idx <= 2 ? 'castle' : (state.level.idx <= 4 ? 'snow' : 'kas')) : 'castle';
+      setBiome(biome);
+      // Skip 1 of every 4 ticks for breathing space
+      if (melodyStep % 4 === 3) { melodyStep++; return; }
+      // Note from biome's pentatonic scale on top of the chord
+      const SCALES = {
+        castle: [392.00, 466.16, 523.25, 622.25, 698.46], // G Bb C Eb F
+        snow:   [440.00, 493.88, 587.33, 659.25, 880.00], // A B D E A
+        kas:    [493.88, 587.33, 659.25, 739.99, 987.77], // B D E F# B
+      };
+      const scale = SCALES[biome];
+      const idx = (melodyStep * 3) % scale.length;
+      const f = scale[idx];
+      // Gentle pluck: short note with long release, very low volume
+      note(f, 0.15, 0.06, 0.02, 0.5, musicGain);
       melodyStep++;
-    }, 340);
+    }, 800); // sparse, 1.25 notes per second max — 4 of every cycle = ~3.2s phrase
   }
 
   function setMuted(v) {
